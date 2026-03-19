@@ -10,36 +10,6 @@ from sklearn.cluster import KMeans
 from sklearn.metrics import accuracy_score
 from scipy.optimize import linear_sum_assignment
 
-# Download training data from open datasets.
-training_data = datasets.MNIST(
-    root="data",
-    train=True,
-    download=True,
-    transform=ToTensor(),
-)
-
-# Download test data from open datasets.
-test_data = datasets.MNIST(
-    root="data",
-    train=False,
-    download=True,
-    transform=ToTensor(),
-)
-
-batch_size = 256
-
-# Create data loaders.
-train_dataloader = DataLoader(training_data, batch_size=batch_size)
-test_dataloader = DataLoader(test_data, batch_size=batch_size)
-
-for X, y in test_dataloader:
-    print(f"Shape of X [N, C, H, W]: {X.shape}")
-    print(f"Shape of y: {y.shape} {y.dtype}")
-    break
-
-device = torch.accelerator.current_accelerator().type if torch.accelerator.is_available() else "cpu"
-print(f"Using {device} device")
-
 # Define model
 class StackedAutoEncoder(nn.Module):
     def __init__(self):
@@ -74,12 +44,6 @@ class StackedAutoEncoder(nn.Module):
         x_recon = self.decoder(z)
         return x_recon, z
     
-
-# Create model
-model = StackedAutoEncoder().to(device)
-loss_fn = nn.MSELoss()
-optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
-
 # --- Phase 1: Train the autoencoder (reconstruction only) ---
 def train_autoencoder(dataloader, model, loss_fn, optimizer, epochs=20):
     size = len(dataloader.dataset)
@@ -105,7 +69,6 @@ def train_autoencoder(dataloader, model, loss_fn, optimizer, epochs=20):
         avg = total_loss / len(dataloader)
         print(f"Epoch {epoch+1:>3d} | Recon Loss: {avg:.6f}")
 
-
 # --- Extract latent vectors from the entire dataset ---
 def get_latent_vectors(dataloader, model):
     model.eval()
@@ -118,7 +81,6 @@ def get_latent_vectors(dataloader, model):
             all_labels.append(y.numpy())
     return np.concatenate(all_z), np.concatenate(all_labels)
 
-
 # --- Phase 2: K-Means in latent space ---
 def run_kmeans(z, n_clusters=10):
     kmeans = KMeans(
@@ -130,13 +92,13 @@ def run_kmeans(z, n_clusters=10):
     cluster_assignments = kmeans.fit_predict(z)
     return cluster_assignments, kmeans
 
-
 # --- Hungarian matching: align cluster IDs to true class labels ---
 # K-Means has no concept of which cluster = which digit.
 # Hungarian algorithm finds the optimal 1-to-1 mapping between
 # cluster indices and true labels that maximises accuracy.
-def hungarian_accuracy(true_labels, cluster_assignments, n_clusters=5):
+def hungarian_accuracy(true_labels, cluster_assignments):
     # Build a cost matrix: cost[i,j] = number of points in cluster i with true label j
+    n_clusters = max(cluster_assignments.max(), true_labels.max()) + 1
     cost_matrix = np.zeros((n_clusters, n_clusters), dtype=np.int64)
     for cluster_id, true_id in zip(cluster_assignments, true_labels):
         cost_matrix[cluster_id, true_id] += 1 #### ----- COME BACK ------ #####
@@ -152,27 +114,67 @@ def hungarian_accuracy(true_labels, cluster_assignments, n_clusters=5):
     return acc, mapping
 
 
-# ============================================================
-# RUN
-# ============================================================
-print("=== Phase 1: Training Autoencoder ===")
-train_autoencoder(train_dataloader, model, loss_fn, optimizer, epochs=2)
 
-print("\n=== Phase 2: K-Means Clustering in Latent Space ===")
-z_train, labels_train = get_latent_vectors(train_dataloader, model)
-z_test,  labels_test  = get_latent_vectors(test_dataloader,  model)
 
-print(f"Latent vectors shape: {z_train.shape}")  # should be (60000, LATENT_DIM)
+if __name__ == "__main__":
+    # Download training data from open datasets.
+    training_data = datasets.MNIST(
+        root="data",
+        train=True,
+        download=True,
+        transform=ToTensor(),
+    )
 
-cluster_assignments_train, kmeans = run_kmeans(z_train, n_clusters=10)
-acc_train, label_mapping = hungarian_accuracy(labels_train, cluster_assignments_train)
-print(f"Train clustering accuracy: {acc_train*100:.1f}%")
-print(f"Cluster → Digit mapping: {label_mapping}")
+    # Download test data from open datasets.
+    test_data = datasets.MNIST(
+        root="data",
+        train=False,
+        download=True,
+        transform=ToTensor(),
+    )
 
-# Apply the same kmeans to test set
-cluster_assignments_test = kmeans.predict(z_test)
+    batch_size = 256
 
-# Remap test clusters using the mapping learned from training
-remapped_test = np.array([label_mapping[c] for c in cluster_assignments_test])
-test_acc = accuracy_score(labels_test, remapped_test)
-print(f"Test  clustering accuracy: {test_acc*100:.1f}%")
+    # Create data loaders.
+    train_dataloader = DataLoader(training_data, batch_size=batch_size)
+    test_dataloader = DataLoader(test_data, batch_size=batch_size)
+
+    for X, y in test_dataloader:
+        print(f"Shape of X [N, C, H, W]: {X.shape}")
+        print(f"Shape of y: {y.shape} {y.dtype}")
+        break
+
+    device = torch.accelerator.current_accelerator().type if torch.accelerator.is_available() else "cpu"
+    print(f"Using {device} device")
+
+
+    # Create model
+    model = StackedAutoEncoder().to(device)
+    loss_fn = nn.MSELoss()
+    optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
+
+    # ============================================================
+    # RUN
+    # ============================================================
+    print("=== Phase 1: Training Autoencoder ===")
+    train_autoencoder(train_dataloader, model, loss_fn, optimizer, epochs=2)
+
+    print("\n=== Phase 2: K-Means Clustering in Latent Space ===")
+    z_train, labels_train = get_latent_vectors(train_dataloader, model)
+    z_test,  labels_test  = get_latent_vectors(test_dataloader,  model)
+
+    print(f"Latent vectors shape: {z_train.shape}")  # should be (60000, LATENT_DIM)
+
+    cluster_assignments_train, kmeans = run_kmeans(z_train, n_clusters=10)
+    acc_train, label_mapping = hungarian_accuracy(labels_train, cluster_assignments_train)
+    print(f"Train clustering accuracy: {acc_train*100:.1f}%")
+    print(f"Cluster → Digit mapping: {label_mapping}")
+
+    # Apply the same kmeans to test set
+    cluster_assignments_test = kmeans.predict(z_test)
+
+    # Remap test clusters using the mapping learned from training
+    remapped_test = np.array([label_mapping[c] for c in cluster_assignments_test])
+    test_acc = accuracy_score(labels_test, remapped_test)
+    print(f"Test  clustering accuracy: {test_acc*100:.1f}%")
+
