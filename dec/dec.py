@@ -10,10 +10,25 @@ from sklearn.cluster import KMeans
 from sklearn.metrics import accuracy_score
 from scipy.optimize import linear_sum_assignment
 
+config = {
+        "lr": 0.001,
+        "latent_dim": 10,
+        "batch_size": 256,
+        "kmeans_seeds": 20,
+        "kmeans_iters": 300,
+        "n_clusters": 10,
+        "batch_size": 256,
+        "epochs": 20,
+        "alpha": 1.0
+    }
+
 # Define model
 class StackedAutoEncoder(nn.Module):
-    def __init__(self):
+    def __init__(self, n_clusters=config['n_clusters'], latent_dim=config['latent_dim'], alpha=config['alpha']):
         super().__init__()
+        self.n_clusters = n_clusters
+        self.alpha = alpha
+        self.latent_dim = latent_dim
         self.flatten = nn.Flatten()
         self.encoder = nn.Sequential(
             nn.Linear(28*28, 500), # Input layer to first hidden layer
@@ -25,10 +40,10 @@ class StackedAutoEncoder(nn.Module):
             nn.Linear(500, 2000), # Latent representation (bottleneck)
             nn.ReLU(True),
             nn.Dropout(0.2),
-            nn.Linear(2000, 10) # Deepest layer of encoder
+            nn.Linear(2000, config["latent_dim"]) # Deepest layer of encoder
         )
         self.decoder = nn.Sequential(
-            nn.Linear(10, 2000),
+            nn.Linear(config["latent_dim"], 2000),
             nn.ReLU(True),
             nn.Linear(2000, 500),
             nn.ReLU(True),
@@ -37,13 +52,20 @@ class StackedAutoEncoder(nn.Module):
             nn.Linear(500, 28*28), # Output layer, same size as input
             nn.Sigmoid() # Use Sigmoid to ensure output pixel values are in [0, 1] range
         )
+        # Centroids stored directly on the model — initialized later from K-Means
+        self.centroids = nn.Parameter(
+            torch.randn(n_clusters, latent_dim),
+            requires_grad=False  # frozen until Phase 3 begins
+        )
+
+    def encode(self, x):
+        return self.encoder(self.flatten(x))
 
     def forward(self, x):
-        x = self.flatten(x)
-        z = self.encoder(x)
+        z = self.encode(x)
         x_recon = self.decoder(z)
         return x_recon, z
-    
+  
 # --- Phase 1: Train the autoencoder (reconstruction only) ---
 def train_autoencoder(dataloader, model, loss_fn, optimizer, epochs=20):
     size = len(dataloader.dataset)
@@ -85,6 +107,7 @@ def get_latent_vectors(dataloader, model):
 def run_kmeans(z, n_clusters=10):
     kmeans = KMeans(
         n_clusters=n_clusters,
+        init='k-means++',
         n_init=20,       # run 20 times with different seeds, keep best
         max_iter=300,
         random_state=42
@@ -93,33 +116,19 @@ def run_kmeans(z, n_clusters=10):
     return cluster_assignments, kmeans
 
 # --- Hungarian matching: align cluster IDs to true class labels ---
-# K-Means has no concept of which cluster = which digit.
-# Hungarian algorithm finds the optimal 1-to-1 mapping between
-# cluster indices and true labels that maximises accuracy.
-def hungarian_accuracy(true_labels, cluster_assignments):
-    # Build a cost matrix: cost[i,j] = number of points in cluster i with true label j
-    n_clusters = max(cluster_assignments.max(), true_labels.max()) + 1
-    cost_matrix = np.zeros((n_clusters, n_clusters), dtype=np.int64)
+def hungarian_accuracy(true_labels, cluster_assignments, n_clusters=10, n_classes=10):
+    cost_matrix = np.zeros((n_clusters, n_classes), dtype=np.int64)
     for cluster_id, true_id in zip(cluster_assignments, true_labels):
-        cost_matrix[cluster_id, true_id] += 1 #### ----- COME BACK ------ #####
-
-    # linear_sum_assignment finds the assignment that maximises the sum
+        cost_matrix[cluster_id, true_id] += 1
     row_ind, col_ind = linear_sum_assignment(cost_matrix, maximize=True)
-    
-    # Build a remapping dict: cluster_id -> best matching true label
     mapping = {row: col for row, col in zip(row_ind, col_ind)}
-    remapped = np.array([mapping[c] for c in cluster_assignments])
-    
-    acc = accuracy_score(true_labels, remapped)
-    return acc, mapping
-
-
-
+    remapped = np.array([mapping.get(c, -1) for c in cluster_assignments])
+    return accuracy_score(true_labels, remapped), mapping
 
 if __name__ == "__main__":
     # Download training data from open datasets.
     training_data = datasets.MNIST(
-        root="data",
+        root="dec/data",
         train=True,
         download=True,
         transform=ToTensor(),
@@ -127,17 +136,15 @@ if __name__ == "__main__":
 
     # Download test data from open datasets.
     test_data = datasets.MNIST(
-        root="data",
+        root="dec/data",
         train=False,
         download=True,
         transform=ToTensor(),
     )
 
-    batch_size = 256
-
     # Create data loaders.
-    train_dataloader = DataLoader(training_data, batch_size=batch_size)
-    test_dataloader = DataLoader(test_data, batch_size=batch_size)
+    train_dataloader = DataLoader(training_data, batch_size=config['batch_size'], shuffle=True)
+    test_dataloader = DataLoader(test_data, batch_size=config['batch_size'])
 
     for X, y in test_dataloader:
         print(f"Shape of X [N, C, H, W]: {X.shape}")
@@ -157,7 +164,7 @@ if __name__ == "__main__":
     # RUN
     # ============================================================
     print("=== Phase 1: Training Autoencoder ===")
-    train_autoencoder(train_dataloader, model, loss_fn, optimizer, epochs=2)
+    train_autoencoder(train_dataloader, model, loss_fn, optimizer, epochs=config["epochs"])
 
     print("\n=== Phase 2: K-Means Clustering in Latent Space ===")
     z_train, labels_train = get_latent_vectors(train_dataloader, model)
@@ -165,7 +172,8 @@ if __name__ == "__main__":
 
     print(f"Latent vectors shape: {z_train.shape}")  # should be (60000, LATENT_DIM)
 
-    cluster_assignments_train, kmeans = run_kmeans(z_train, n_clusters=10)
+    cluster_assignments_train, kmeans = run_kmeans(z_train, n_clusters=config["n_clusters"])
+
     acc_train, label_mapping = hungarian_accuracy(labels_train, cluster_assignments_train)
     print(f"Train clustering accuracy: {acc_train*100:.1f}%")
     print(f"Cluster → Digit mapping: {label_mapping}")
