@@ -1,10 +1,11 @@
+"""TODO weird bug where after cluster refinement the cluster assignment is better but this causes the accuracy of the test set to go down"""
+
 import torch
 from torch import nn
 from torch.utils.data import DataLoader
 from torchvision import datasets
 from torchvision.transforms import ToTensor
 import torch.nn.functional as F
-import matplotlib.pyplot as plt
 import numpy as np
 from sklearn.cluster import KMeans
 from sklearn.metrics import accuracy_score
@@ -18,8 +19,10 @@ config = {
         "kmeans_iters": 300,
         "n_clusters": 10,
         "batch_size": 256,
-        "epochs": 20,
-        "alpha": 1.0
+        "epochs": 10,
+        "alpha": 1.0,
+        "refine_epochs":10,
+        "tol": 0.001
     }
 
 # Define model
@@ -33,13 +36,10 @@ class StackedAutoEncoder(nn.Module):
         self.encoder = nn.Sequential(
             nn.Linear(28*28, 500), # Input layer to first hidden layer
             nn.ReLU(True),
-            nn.Dropout(0.2),
             nn.Linear(500, 500),
             nn.ReLU(True),
-            nn.Dropout(0.2),
             nn.Linear(500, 2000), # Latent representation (bottleneck)
             nn.ReLU(True),
-            nn.Dropout(0.2),
             nn.Linear(2000, config["latent_dim"]) # Deepest layer of encoder
         )
         self.decoder = nn.Sequential(
@@ -55,11 +55,23 @@ class StackedAutoEncoder(nn.Module):
         # Centroids stored directly on the model — initialized later from K-Means
         self.centroids = nn.Parameter(
             torch.randn(n_clusters, latent_dim),
-            requires_grad=False  # frozen until Phase 3 begins
+            requires_grad=False
         )
 
     def encode(self, x):
         return self.encoder(self.flatten(x))
+    
+    def soft_assign(self, z):
+        dist = torch.cdist(z, self.centroids) ** 2
+        num = (1+dist/self.alpha) ** (-(self.alpha+1)/2)
+        return num/num.sum(dim=1, keepdim=True)
+    
+    def init_centroids(self, cluster_centers):
+        with torch.no_grad():
+            self.centroids.copy_(
+                torch.tensor(cluster_centers, dtype=torch.float32)
+            )
+        self.centroids.requires_grad = True
 
     def forward(self, x):
         z = self.encode(x)
@@ -115,6 +127,61 @@ def run_kmeans(z, n_clusters=10):
     cluster_assignments = kmeans.fit_predict(z)
     return cluster_assignments, kmeans
 
+# --- Phase 3: Refine cluster centroids
+def target_distribution(q):
+    f = q.sum(dim=0)
+    p = (q ** 2) / f
+    return p / p.sum(dim=1, keepdim=True)
+
+def train_dec(dataloader, model, optimizer_dec, tol=config['tol'], epochs=20, run = "epoch"):
+    prev_assignments = None
+    epoch=0
+    if run == "tol":
+        print(f"\nRunning until only {tol*100}% have changed")
+    elif run == "epoch":
+        print(f"\nRunning for {epochs} epochs")
+
+    while True:
+        if run == "epoch" and epoch >= epochs: break
+        # Compute P over full dataset
+        model.eval()
+        all_q = []
+        with torch.no_grad():
+            for X, _ in dataloader:
+                z = model.encode(X.to(device))
+                all_q.append(model.soft_assign(z).cpu())
+        all_q  = torch.cat(all_q)
+        p_full = target_distribution(all_q)
+
+        # Convergence check
+        current_assignments = all_q.argmax(dim=1).numpy()
+        if prev_assignments is not None:
+            changed = (current_assignments != prev_assignments).mean()
+            print(f"  Epoch {epoch+1}: {changed*100:.2f}% changed")
+            if changed < tol:
+                print(f"Converged at epoch {epoch+1}"); break
+        prev_assignments = current_assignments.copy()
+
+        # Training pass
+        model.train()
+        total_loss = 0
+        for batch_idx, (X, _) in enumerate(dataloader):
+            X = X.to(device)
+            start   = batch_idx * dataloader.batch_size
+            p_batch = p_full[start : start + len(X)].to(device)
+
+            z       = model.encode(X)
+            q_batch = model.soft_assign(z)
+            loss    = F.kl_div(q_batch.log(), p_batch, reduction='batchmean')
+
+            optimizer_dec.zero_grad()
+            loss.backward()
+            optimizer_dec.step()
+            total_loss += loss.item()
+
+        print(f"Epoch {epoch+1:>3d} | KL Loss: {total_loss/len(dataloader):.6f}")
+        epoch+=1
+
 # --- Hungarian matching: align cluster IDs to true class labels ---
 def hungarian_accuracy(true_labels, cluster_assignments, n_clusters=10, n_classes=10):
     cost_matrix = np.zeros((n_clusters, n_classes), dtype=np.int64)
@@ -142,8 +209,9 @@ if __name__ == "__main__":
         transform=ToTensor(),
     )
 
-    # Create data loaders.
+    # Create data loaders
     train_dataloader = DataLoader(training_data, batch_size=config['batch_size'], shuffle=True)
+    train_dataloader_noshuffle = DataLoader(training_data, batch_size=config['batch_size'], shuffle=False)
     test_dataloader = DataLoader(test_data, batch_size=config['batch_size'])
 
     for X, y in test_dataloader:
@@ -160,29 +228,47 @@ if __name__ == "__main__":
     loss_fn = nn.MSELoss()
     optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
 
-    # ============================================================
-    # RUN
-    # ============================================================
+    # Train model - create a latent space via encoder
     print("=== Phase 1: Training Autoencoder ===")
     train_autoencoder(train_dataloader, model, loss_fn, optimizer, epochs=config["epochs"])
 
+    # Create intial k-means centroids in latent space
     print("\n=== Phase 2: K-Means Clustering in Latent Space ===")
-    z_train, labels_train = get_latent_vectors(train_dataloader, model)
+    z_train, labels_train = get_latent_vectors(train_dataloader_noshuffle, model)
     z_test,  labels_test  = get_latent_vectors(test_dataloader,  model)
-
-    print(f"Latent vectors shape: {z_train.shape}")  # should be (60000, LATENT_DIM)
-
+    print(f"Latent vectors shape: {z_train.shape}")  # should be (60000, latent_dim)
     cluster_assignments_train, kmeans = run_kmeans(z_train, n_clusters=config["n_clusters"])
+    cluster_assignments_test, _ = run_kmeans(z_test, n_clusters=config["n_clusters"])
 
+    print("\n=== Phase 2b: Initial Accuracy")
     acc_train, label_mapping = hungarian_accuracy(labels_train, cluster_assignments_train)
+    acc_test, _ = hungarian_accuracy(labels_test, cluster_assignments_test)
     print(f"Train clustering accuracy: {acc_train*100:.1f}%")
+    print(f"Test clustering accuracy: {acc_test*100:.1f}%")
     print(f"Cluster → Digit mapping: {label_mapping}")
 
-    # Apply the same kmeans to test set
-    cluster_assignments_test = kmeans.predict(z_test)
+    print("\n=== Phase 3: Cluster refinement ===")
+    model.init_centroids(kmeans.cluster_centers_)
+    optimizer_dec = torch.optim.SGD(
+        model.parameters(),  # encoder + centroids, decoder gets frozen naturally
+        lr=0.01
+    )
+    train_dec(train_dataloader_noshuffle, model, optimizer_dec, epochs=config["refine_epochs"], run="epoch") # run = epoch / tol
 
-    # Remap test clusters using the mapping learned from training
-    remapped_test = np.array([label_mapping[c] for c in cluster_assignments_test])
-    test_acc = accuracy_score(labels_test, remapped_test)
-    print(f"Test  clustering accuracy: {test_acc*100:.1f}%")
+    print("\n=== Final Evaluation ===")
+    model.eval()
+    all_q, all_labels = [], []
+    with torch.no_grad():
+        for X, y in test_dataloader:
+            z = model.encode(X.to(device))
+            q = model.soft_assign(z)
+            all_q.append(q.cpu())
+            all_labels.append(y)
 
+    all_q = torch.cat(all_q)
+    all_labels = torch.cat(all_labels).numpy()
+    final_assignments = all_q.argmax(dim=1).numpy()
+
+    test_acc, label_mapping = hungarian_accuracy(all_labels, final_assignments)
+    print(f"Test clustering accuracy: {test_acc*100:.1f}%")
+    print(f"Cluster -> Digit mapping: {label_mapping}")
