@@ -12,7 +12,7 @@ from sklearn.metrics import accuracy_score
 from scipy.optimize import linear_sum_assignment
 
 config = {
-        "lr": 0.0001,
+        "lr": 0.01,
         "latent_dim": 10,
         "batch_size": 256,
         "kmeans_seeds": 30,
@@ -20,8 +20,8 @@ config = {
         "n_clusters": 10,
         "epochs": 100,
         "alpha": 1.0,
-        "refine_epochs":100,
-        "tol": 0.01
+        "refine_epochs":50,
+        "tol": 0.001
     }
 
 # Define model
@@ -248,7 +248,7 @@ if __name__ == "__main__":
     z_test,  labels_test  = get_latent_vectors(test_dataloader,  model)
     print(f"Latent vectors shape: {z_train.shape}")  # should be (60000, latent_dim)
     cluster_assignments_train, kmeans = run_kmeans(z_train, n_clusters=config["n_clusters"])
-    cluster_assignments_test, _ = run_kmeans(z_test, n_clusters=config["n_clusters"])
+    cluster_assignments_test = kmeans.predict(z_test)
 
     print("\n=== Phase 2b: Initial Accuracy")
     acc_train, label_mapping = hungarian_accuracy(labels_train, cluster_assignments_train)
@@ -263,7 +263,7 @@ if __name__ == "__main__":
         model.parameters(),  # encoder + centroids, decoder gets frozen naturally
         lr=config["lr"]
     )
-    train_dec(train_dataloader, model, optimizer_dec, epochs=config["refine_epochs"], run="epoch") # run = epoch / tol
+    train_dec(train_dataloader_noshuffle, model, optimizer_dec, epochs=config["refine_epochs"], run="epoch") # run = epoch / tol
 
     print("\n=== Final Evaluation ===")
     model.eval()
