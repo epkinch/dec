@@ -1,5 +1,3 @@
-"""TODO weird bug where after cluster refinement the cluster assignment is better but this causes the accuracy of the test set to go down"""
-
 import torch
 from torch import nn
 from torch.utils.data import DataLoader
