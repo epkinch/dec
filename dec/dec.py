@@ -19,9 +19,9 @@ config = {
         "kmeans_iters": 300,
         "n_clusters": 10,
         "batch_size": 256,
-        "epochs": 10,
+        "epochs": 75,
         "alpha": 1.0,
-        "refine_epochs":10,
+        "refine_epochs":50,
         "tol": 0.001
     }
 
@@ -34,11 +34,11 @@ class StackedAutoEncoder(nn.Module):
         self.latent_dim = latent_dim
         self.flatten = nn.Flatten()
         self.encoder = nn.Sequential(
-            nn.Linear(28*28, 500), # Input layer to first hidden layer
+            nn.Linear(28*28, 500),
             nn.ReLU(True),
             nn.Linear(500, 500),
             nn.ReLU(True),
-            nn.Linear(500, 2000), # Latent representation (bottleneck)
+            nn.Linear(500, 2000),
             nn.ReLU(True),
             nn.Linear(2000, config["latent_dim"]) # Deepest layer of encoder
         )
@@ -50,9 +50,9 @@ class StackedAutoEncoder(nn.Module):
             nn.Linear(500, 500),
             nn.ReLU(True),
             nn.Linear(500, 28*28), # Output layer, same size as input
-            nn.Sigmoid() # Use Sigmoid to ensure output pixel values are in [0, 1] range
+            nn.Sigmoid()
         )
-        # Centroids stored directly on the model — initialized later from K-Means
+        # Centroids initialized later from K-Means
         self.centroids = nn.Parameter(
             torch.randn(n_clusters, latent_dim),
             requires_grad=False
@@ -84,11 +84,10 @@ def train_autoencoder(dataloader, model, loss_fn, optimizer, epochs=20):
     model.train()
     for epoch in range(epochs):
         total_loss = 0
-        for batch, (X, _) in enumerate(dataloader):          # _ = ignore labels entirely during AE training
+        for batch, (X, _) in enumerate(dataloader):
             X = X.to(device)
             x_recon, z = model(X)
 
-            # Loss is pixel reconstruction error — shape [batch,784] vs [batch,784]
             loss = loss_fn(x_recon, X.view(X.size(0), -1))
 
             optimizer.zero_grad()
@@ -150,7 +149,7 @@ def train_dec(dataloader, model, optimizer_dec, tol=config['tol'], epochs=20, ru
             for X, _ in dataloader:
                 z = model.encode(X.to(device))
                 all_q.append(model.soft_assign(z).cpu())
-        all_q  = torch.cat(all_q)
+        all_q = torch.cat(all_q)
         p_full = target_distribution(all_q)
 
         # Convergence check
@@ -167,12 +166,12 @@ def train_dec(dataloader, model, optimizer_dec, tol=config['tol'], epochs=20, ru
         total_loss = 0
         for batch_idx, (X, _) in enumerate(dataloader):
             X = X.to(device)
-            start   = batch_idx * dataloader.batch_size
+            start = batch_idx * dataloader.batch_size
             p_batch = p_full[start : start + len(X)].to(device)
 
-            z       = model.encode(X)
+            z = model.encode(X)
             q_batch = model.soft_assign(z)
-            loss    = F.kl_div(q_batch.log(), p_batch, reduction='batchmean')
+            loss = F.kl_div(q_batch.log(), p_batch, reduction='batchmean')
 
             optimizer_dec.zero_grad()
             loss.backward()
@@ -214,14 +213,8 @@ if __name__ == "__main__":
     train_dataloader_noshuffle = DataLoader(training_data, batch_size=config['batch_size'], shuffle=False)
     test_dataloader = DataLoader(test_data, batch_size=config['batch_size'])
 
-    for X, y in test_dataloader:
-        print(f"Shape of X [N, C, H, W]: {X.shape}")
-        print(f"Shape of y: {y.shape} {y.dtype}")
-        break
-
     device = torch.accelerator.current_accelerator().type if torch.accelerator.is_available() else "cpu"
     print(f"Using {device} device")
-
 
     # Create model
     model = StackedAutoEncoder().to(device)
