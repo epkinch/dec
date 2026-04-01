@@ -10,10 +10,10 @@ from sklearn.metrics import accuracy_score
 from scipy.optimize import linear_sum_assignment
 
 config = {
-        "lr": 0.001,
+        "lr": 0.01,
         "latent_dim": 10,
         "batch_size": 256,
-        "kmeans_seeds": 20,
+        "kmeans_seeds": 30,
         "kmeans_iters": 300,
         "n_clusters": 10,
         "batch_size": 256,
@@ -127,11 +127,16 @@ def run_kmeans(z, n_clusters=10):
 # --- Phase 3: Refine cluster centroids
 def target_distribution(q):
     f = q.sum(dim=0)
-    p = (q ** 2) / f
+    p = (q ** 2) / (f + 1e-10)
     return p / p.sum(dim=1, keepdim=True)
 
 def train_dec(dataloader, model, optimizer_dec, tol=config['tol'], epochs=20, run = "epoch"):
     prev_assignments = None
+
+    # Freeze decoder — KL loss should only update encoder + centroids
+    for param in model.decoder.parameters():
+        param.requires_grad = False
+
     epoch=0
     if run == "tol":
         print(f"\nRunning until only {tol*100}% have changed")
@@ -160,16 +165,22 @@ def train_dec(dataloader, model, optimizer_dec, tol=config['tol'], epochs=20, ru
         prev_assignments = current_assignments.copy()
 
         # Training pass
+        p_loader = DataLoader(
+            torch.utils.data.TensorDataset(p_full),
+            batch_size=dataloader.batch_size,
+            shuffle=False  # must match dataloader ordering
+        )
         model.train()
         total_loss = 0
-        for batch_idx, (X, _) in enumerate(dataloader):
-            X = X.to(device)
-            start = batch_idx * dataloader.batch_size
-            p_batch = p_full[start : start + len(X)].to(device)
+        for (X, _), (p_batch,) in zip(dataloader, p_loader):
+            X       = X.to(device)
+            p_batch = p_batch.to(device)
 
             z = model.encode(X)
             q_batch = model.soft_assign(z)
-            loss = F.kl_div(q_batch.log(), p_batch, reduction='batchmean')
+            # loss    = F.kl_div(q_batch.log(), p_batch, reduction='batchmean')
+            loss = (p_batch * ((p_batch + 1e-10) / (q_batch + 1e-10)).log()).sum(dim=1).mean()
+
 
             optimizer_dec.zero_grad()
             loss.backward()
@@ -229,7 +240,7 @@ if __name__ == "__main__":
     z_test,  labels_test  = get_latent_vectors(test_dataloader,  model)
     print(f"Latent vectors shape: {z_train.shape}")  # should be (60000, latent_dim)
     cluster_assignments_train, kmeans = run_kmeans(z_train, n_clusters=config["n_clusters"])
-    cluster_assignments_test, _ = run_kmeans(z_test, n_clusters=config["n_clusters"])
+    cluster_assignments_test = kmeans.predict(z_test)
 
     print("\n=== Phase 2b: Initial Accuracy")
     acc_train, label_mapping = hungarian_accuracy(labels_train, cluster_assignments_train)
@@ -242,7 +253,7 @@ if __name__ == "__main__":
     model.init_centroids(kmeans.cluster_centers_)
     optimizer_dec = torch.optim.SGD(
         model.parameters(),  # encoder + centroids, decoder gets frozen naturally
-        lr=0.01
+        lr=config["lr"]
     )
     train_dec(train_dataloader_noshuffle, model, optimizer_dec, epochs=config["refine_epochs"], run="epoch") # run = epoch / tol
 
