@@ -1,5 +1,3 @@
-"""TODO weird bug where after cluster refinement the cluster assignment is better but this causes the accuracy of the test set to go down"""
-
 import torch
 from torch import nn
 from torch.utils.data import DataLoader
@@ -33,11 +31,11 @@ class StackedAutoEncoder(nn.Module):
         self.latent_dim = latent_dim
         self.flatten = nn.Flatten()
         self.encoder = nn.Sequential(
-            nn.Linear(28*28, 500), # Input layer to first hidden layer
+            nn.Linear(28*28, 500),
             nn.ReLU(True),
             nn.Linear(500, 500),
             nn.ReLU(True),
-            nn.Linear(500, 2000), # Latent representation (bottleneck)
+            nn.Linear(500, 2000),
             nn.ReLU(True),
             nn.Linear(2000, config["latent_dim"]) # Deepest layer of encoder
         )
@@ -51,7 +49,7 @@ class StackedAutoEncoder(nn.Module):
             nn.Linear(500, 28*28), # Output layer, same size as input
             nn.Sigmoid() # Use Sigmoid to ensure output pixel values are in [0, 1] range
         )
-        # Centroids stored directly on the model — initialized later from K-Means
+        # Centroids initialized later from K-Means
         self.centroids = nn.Parameter(
             torch.randn(n_clusters, latent_dim),
             requires_grad=False
