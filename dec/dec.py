@@ -22,9 +22,9 @@ config = {
         "kmeans_iters": 300,
         "n_clusters": 10,
         "batch_size": 256,
-        "epochs": 75,
+        "epochs": 2,
         "alpha": 1.0,
-        "refine_epochs": 50,
+        "refine_epochs": 2,
         "tol": 0.001
     }
 
@@ -40,7 +40,6 @@ class StackedAutoEncoder(nn.Module):
         self.latent_dim = latent_dim
         self.flatten = nn.Flatten()
         self.encoder = nn.Sequential(
-            # nn.Linear(28*28, 500),
             nn.Linear(config['input_dim'], 500),
             nn.ReLU(True),
             nn.Linear(500, 500),
@@ -56,7 +55,6 @@ class StackedAutoEncoder(nn.Module):
             nn.ReLU(True),
             nn.Linear(500, 500),
             nn.ReLU(True),
-            # nn.Linear(500, 28*28), # Output layer, same size as input
             nn.Linear(500, config['input_dim']),
             nn.Sigmoid()
         )
@@ -191,7 +189,6 @@ def train_dec(dataloader, model, optimizer_dec, tol=config['tol'], epochs=20, ru
             # loss    = F.kl_div(q_batch.log(), p_batch, reduction='batchmean')
             loss = (p_batch * ((p_batch + 1e-10) / (q_batch + 1e-10)).log()).sum(dim=1).mean()
             
-           
             optimizer_dec.zero_grad()
             loss.backward()
             optimizer_dec.step()
@@ -218,15 +215,11 @@ def run_pipeline(dataset_config, hyperparameter, backprop):
         training_data = training_data()
     if callable(test_data):
         test_data = test_data()
+
     config['alpha'] = hyperparameter
-    input_dim = 0
     if dataset_config['name'] == "MNIST":
-        input_dim = 28*28
-    elif dataset_config['name'] == "STL10":
-        input_dim = 2352
-    elif dataset_config['name'] == "REUTERS":
-        input_dim = 2000
-    config['input_dim'] = input_dim
+        config['input_dim'] = 28*28
+   
     
     # Create data loaders
     train_dataloader = DataLoader(training_data, batch_size=config['batch_size'], shuffle=True)
@@ -259,6 +252,8 @@ def run_pipeline(dataset_config, hyperparameter, backprop):
     print(f"Test clustering accuracy: {acc_test*100:.1f}%")
     print(f"Cluster → Digit mapping: {label_mapping}")
 
+    if not backprop:
+        return (acc_test + acc_train)/2*100
  
     print("\n=== Phase 3: Cluster refinement ===")
     
@@ -268,7 +263,7 @@ def run_pipeline(dataset_config, hyperparameter, backprop):
         lr=config["lr"]
     )
 
-    train_dec(train_dataloader_noshuffle, model, optimizer_dec, epochs=config["refine_epochs"], run="epoch", backprop=backprop) # run = epoch / tol
+    train_dec(train_dataloader_noshuffle, model, optimizer_dec, epochs=config["refine_epochs"], run="epoch") # run = epoch / tol
 
     print("\n=== Final Evaluation ===")
     model.eval()
@@ -290,9 +285,9 @@ def run_pipeline(dataset_config, hyperparameter, backprop):
     print(f"Test clustering accuracy: {test_acc*100:.1f}%")
     return test_acc*100
    
-def save_accuracy(backprop, dataset_name, hyperparameter, test_acc, filename="accuracies.csv"):
-    header = ["backprop", "dataset", "hyperparameter", "test_acc"]
-    row = [backprop, dataset_name, hyperparameter, test_acc]
+def save_accuracy(model, dataset_name, hyperparameter, test_acc, filename="accuracies.csv"):
+    header = ["model", "dataset", "hyperparameter", "test_acc"]
+    row = [model, dataset_name, hyperparameter, test_acc]
 
     # Append if file exists, otherwise write header
     try:
@@ -305,7 +300,43 @@ def save_accuracy(backprop, dataset_name, hyperparameter, test_acc, filename="ac
             writer = csv.writer(f)
             writer.writerow(row)
 
+def load_reuters_10k(train):
+    if train:
+        training_data = TensorDataset(
+            torch.tensor(load_reuters("train", return_X_y=True)[0], dtype=torch.float32),
+            torch.tensor(load_reuters("train", return_X_y=True)[1], dtype=torch.long)
+        )
+    else:
+        training_data = TensorDataset(
+            torch.tensor(load_reuters("test", return_X_y=True)[0], dtype=torch.float32),
+            torch.tensor(load_reuters("test", return_X_y=True)[1], dtype=torch.long)
+        )
+
+    N = len(training_data)
+    subset_size = 10000
+    indices = torch.randperm(N)[:subset_size]
+    X_sub = training_data.tensors[0][indices]
+    y_sub = training_data.tensors[1][indices]
+    training_data = TensorDataset(X_sub, y_sub)
+    return training_data
+
 def main():
+    dataset_config = {
+        "name": "MNIST",
+        "train": datasets.MNIST(
+            root="dec/data",
+            train=True,
+            download=True,
+            transform=ToTensor(),
+        ),
+        "test": datasets.MNIST(
+            root="dec/data",
+            train=False,
+            download=True,
+            transform=ToTensor(),
+        ),
+        "n_clusters": 10,
+    }
     if len(sys.argv) > 1:
         if sys.argv[1] == "1":
             dataset_configs = [
@@ -325,37 +356,31 @@ def main():
                     ),
                     "n_clusters": 10
                 },
-                {
-                    "name": "STL10",
-                    "train": datasets.STL10(
-                        root="dec/data",
-                        split="train",
-                        download=True,
-                        transform=Compose([Resize(28), ToTensor()])
-                    ),
-                    "test": datasets.STL10(
-                        root="dec/data",
-                        split="test",
-                        download=True,
-                        transform=Compose([Resize(28), ToTensor()])
-                    ),
-                    "n_clusters": 10
-                },
-                {
-                    "name": "REUTERS",
-                    "train": lambda: TensorDataset(
-                        torch.tensor(load_reuters("train", return_X_y=True)[0], dtype=torch.float32),
-                        torch.tensor(load_reuters("train", return_X_y=True)[1], dtype=torch.long)
-                    ),
-                    "test": lambda: TensorDataset(
-                        torch.tensor(load_reuters("test", return_X_y=True)[0], dtype=torch.float32),
-                        torch.tensor(load_reuters("test", return_X_y=True)[1], dtype=torch.long)
-                    ),
-                    "n_clusters": 4,
-                },
+                # {
+                #     "name": "STL10",
+                #     "train": datasets.STL10(
+                #         root="dec/data",
+                #         split="train",
+                #         download=True,
+                #         transform=ToTensor()
+                #     ),
+                #     "test": datasets.STL10(
+                #         root="dec/data",
+                #         split="test",
+                #         download=True,
+                #         transform=ToTensor()
+                #     ),
+                #     "n_clusters": 10
+                # },
+                # {
+                #     "name": "REUTERS10k",
+                #     "train": lambda: load_reuters_10k(True),
+                #     "test": lambda: load_reuters_10k(False),
+                #     "n_clusters": 4,
+                # },
             ]
             for dataset_config in dataset_configs:
-                backprop = True
+                backprop = False
                 for hyperparameter in range(1, 11):
                     acc = run_pipeline(dataset_config, hyperparameter, backprop)
                     save_accuracy(backprop, dataset_config['name'], hyperparameter, acc)
@@ -363,79 +388,7 @@ def main():
                     
             return
     else:
-        # Download training data from open datasets.
-        training_data = datasets.MNIST(
-            root="dec/data",
-            train=True,
-            download=True,
-            transform=ToTensor(),
-        )
-
-        # Download test data from open datasets.
-        test_data = datasets.MNIST(
-            root="dec/data",
-            train=False,
-            download=True,
-            transform=ToTensor(),
-        )
-
-        # Create data loaders
-        train_dataloader = DataLoader(training_data, batch_size=config['batch_size'], shuffle=True)
-        train_dataloader_noshuffle = DataLoader(training_data, batch_size=config['batch_size'], shuffle=False)
-        test_dataloader = DataLoader(test_data, batch_size=config['batch_size'])
-
-        # device = torch.accelerator.current_accelerator().type if torch.accelerator.is_available() else "cpu"
-        print(f"Using {device} device")
-
-        # Create model
-        model = StackedAutoEncoder().to(device)
-        loss_fn = nn.MSELoss()
-        optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
-
-        # Train model - create a latent space via encoder
-        print("=== Phase 1: Training Autoencoder ===")
-        train_autoencoder(train_dataloader, model, loss_fn, optimizer, epochs=config["epochs"])
-
-        # Create intial k-means centroids in latent space
-        print("\n=== Phase 2: K-Means Clustering in Latent Space ===")
-        z_train, labels_train = get_latent_vectors(train_dataloader_noshuffle, model)
-        z_test,  labels_test  = get_latent_vectors(test_dataloader,  model)
-        print(f"Latent vectors shape: {z_train.shape}")  # should be (60000, latent_dim)
-        cluster_assignments_train, kmeans = run_kmeans(z_train, n_clusters=config["n_clusters"])
-        cluster_assignments_test = kmeans.predict(z_test)
-
-        print("\n=== Phase 2b: Initial Accuracy")
-        acc_train, label_mapping = hungarian_accuracy(labels_train, cluster_assignments_train)
-        acc_test, _ = hungarian_accuracy(labels_test, cluster_assignments_test)
-        print(f"Train clustering accuracy: {acc_train*100:.1f}%")
-        print(f"Test clustering accuracy: {acc_test*100:.1f}%")
-        print(f"Cluster → Digit mapping: {label_mapping}")
-
-        print("\n=== Phase 3: Cluster refinement ===")
-        model.init_centroids(kmeans.cluster_centers_)
-        optimizer_dec = torch.optim.SGD(
-            model.parameters(),  # encoder + centroids, decoder gets frozen naturally
-            lr=config["lr"]
-        )
-        train_dec(train_dataloader_noshuffle, model, optimizer_dec, epochs=config["refine_epochs"], run="epoch") # run = epoch / tol
-
-        print("\n=== Final Evaluation ===")
-        model.eval()
-        all_q, all_labels = [], []
-        with torch.no_grad():
-            for X, y in test_dataloader:
-                z = model.encode(X.to(device))
-                q = model.soft_assign(z)
-                all_q.append(q.cpu())
-                all_labels.append(y)
-
-        all_q = torch.cat(all_q)
-        all_labels = torch.cat(all_labels).numpy()
-        final_assignments = all_q.argmax(dim=1).numpy()
-
-        test_acc, label_mapping = hungarian_accuracy(all_labels, final_assignments)
-        print(f"Test clustering accuracy: {test_acc*100:.1f}%")
-        print(f"Cluster -> Digit mapping: {label_mapping}")
+        run_pipeline(dataset_config, 1, True)
 
 if __name__ == "__main__":
     main()
