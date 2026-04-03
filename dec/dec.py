@@ -1,16 +1,21 @@
+import csv
+import sys
+
 import torch
 from torch import nn
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, TensorDataset
 from torchvision import datasets
-from torchvision.transforms import ToTensor
+from torchvision.transforms import ToTensor, Compose, Resize
 import torch.nn.functional as F
 import numpy as np
 from sklearn.cluster import KMeans
 from sklearn.metrics import accuracy_score
 from scipy.optimize import linear_sum_assignment
+from clustpy.data import load_reuters
 
 config = {
         "lr": 0.01,
+        "input_dim": 28*28,
         "latent_dim": 10,
         "batch_size": 256,
         "kmeans_seeds": 30,
@@ -19,9 +24,12 @@ config = {
         "batch_size": 256,
         "epochs": 75,
         "alpha": 1.0,
-        "refine_epochs":50,
+        "refine_epochs": 50,
         "tol": 0.001
     }
+
+# device = torch.accelerator.current_accelerator().type if torch.accelerator.is_available() else "cpu"
+device = "cpu"
 
 # Define model
 class StackedAutoEncoder(nn.Module):
@@ -32,7 +40,8 @@ class StackedAutoEncoder(nn.Module):
         self.latent_dim = latent_dim
         self.flatten = nn.Flatten()
         self.encoder = nn.Sequential(
-            nn.Linear(28*28, 500),
+            # nn.Linear(28*28, 500),
+            nn.Linear(config['input_dim'], 500),
             nn.ReLU(True),
             nn.Linear(500, 500),
             nn.ReLU(True),
@@ -47,12 +56,13 @@ class StackedAutoEncoder(nn.Module):
             nn.ReLU(True),
             nn.Linear(500, 500),
             nn.ReLU(True),
-            nn.Linear(500, 28*28), # Output layer, same size as input
+            # nn.Linear(500, 28*28), # Output layer, same size as input
+            nn.Linear(500, config['input_dim']),
             nn.Sigmoid()
         )
         # Centroids initialized later from K-Means
         self.centroids = nn.Parameter(
-            torch.randn(n_clusters, latent_dim),
+            torch.randn(n_clusters, config["latent_dim"]),
             requires_grad=False
         )
 
@@ -130,7 +140,7 @@ def target_distribution(q):
     p = (q ** 2) / (f + 1e-10)
     return p / p.sum(dim=1, keepdim=True)
 
-def train_dec(dataloader, model, optimizer_dec, tol=config['tol'], epochs=20, run = "epoch"):
+def train_dec(dataloader, model, optimizer_dec, tol=config['tol'], epochs=20, run = "epoch", backprop = True):
     prev_assignments = None
 
     # Freeze decoder — KL loss should only update encoder + centroids
@@ -180,8 +190,8 @@ def train_dec(dataloader, model, optimizer_dec, tol=config['tol'], epochs=20, ru
             q_batch = model.soft_assign(z)
             # loss    = F.kl_div(q_batch.log(), p_batch, reduction='batchmean')
             loss = (p_batch * ((p_batch + 1e-10) / (q_batch + 1e-10)).log()).sum(dim=1).mean()
-
-
+            
+           
             optimizer_dec.zero_grad()
             loss.backward()
             optimizer_dec.step()
@@ -200,29 +210,29 @@ def hungarian_accuracy(true_labels, cluster_assignments, n_clusters=10, n_classe
     remapped = np.array([mapping.get(c, -1) for c in cluster_assignments])
     return accuracy_score(true_labels, remapped), mapping
 
-if __name__ == "__main__":
-    # Download training data from open datasets.
-    training_data = datasets.MNIST(
-        root="dec/data",
-        train=True,
-        download=True,
-        transform=ToTensor(),
-    )
-
-    # Download test data from open datasets.
-    test_data = datasets.MNIST(
-        root="dec/data",
-        train=False,
-        download=True,
-        transform=ToTensor(),
-    )
-
+def run_pipeline(dataset_config, hyperparameter, backprop):
+    # update config
+    training_data = dataset_config['train']
+    test_data = dataset_config['test']
+    if callable(training_data):
+        training_data = training_data()
+    if callable(test_data):
+        test_data = test_data()
+    config['alpha'] = hyperparameter
+    input_dim = 0
+    if dataset_config['name'] == "MNIST":
+        input_dim = 28*28
+    elif dataset_config['name'] == "STL10":
+        input_dim = 2352
+    elif dataset_config['name'] == "REUTERS":
+        input_dim = 2000
+    config['input_dim'] = input_dim
+    
     # Create data loaders
     train_dataloader = DataLoader(training_data, batch_size=config['batch_size'], shuffle=True)
     train_dataloader_noshuffle = DataLoader(training_data, batch_size=config['batch_size'], shuffle=False)
     test_dataloader = DataLoader(test_data, batch_size=config['batch_size'])
 
-    device = torch.accelerator.current_accelerator().type if torch.accelerator.is_available() else "cpu"
     print(f"Using {device} device")
 
     # Create model
@@ -249,13 +259,16 @@ if __name__ == "__main__":
     print(f"Test clustering accuracy: {acc_test*100:.1f}%")
     print(f"Cluster → Digit mapping: {label_mapping}")
 
+ 
     print("\n=== Phase 3: Cluster refinement ===")
+    
     model.init_centroids(kmeans.cluster_centers_)
     optimizer_dec = torch.optim.SGD(
-        model.parameters(),  # encoder + centroids, decoder gets frozen naturally
+        filter(lambda p: p.requires_grad, model.parameters()),  # encoder + centroids, decoder gets frozen naturally
         lr=config["lr"]
     )
-    train_dec(train_dataloader_noshuffle, model, optimizer_dec, epochs=config["refine_epochs"], run="epoch") # run = epoch / tol
+
+    train_dec(train_dataloader_noshuffle, model, optimizer_dec, epochs=config["refine_epochs"], run="epoch", backprop=backprop) # run = epoch / tol
 
     print("\n=== Final Evaluation ===")
     model.eval()
@@ -272,5 +285,157 @@ if __name__ == "__main__":
     final_assignments = all_q.argmax(dim=1).numpy()
 
     test_acc, label_mapping = hungarian_accuracy(all_labels, final_assignments)
+    print(f"Model: {dataset_config['name']}")
+    print(f"Latent Dimensions: {config['latent_dim']}")
     print(f"Test clustering accuracy: {test_acc*100:.1f}%")
-    print(f"Cluster -> Digit mapping: {label_mapping}")
+    return test_acc*100
+   
+def save_accuracy(backprop, dataset_name, hyperparameter, test_acc, filename="accuracies.csv"):
+    header = ["backprop", "dataset", "hyperparameter", "test_acc"]
+    row = [backprop, dataset_name, hyperparameter, test_acc]
+
+    # Append if file exists, otherwise write header
+    try:
+        with open(filename, "x", newline="") as f:  # creates file if not exists
+            writer = csv.writer(f)
+            writer.writerow(header)
+            writer.writerow(row)
+    except FileExistsError:
+        with open(filename, "a", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow(row)
+
+def main():
+    if len(sys.argv) > 1:
+        if sys.argv[1] == "1":
+            dataset_configs = [
+                {
+                    "name": "MNIST",
+                    "train": datasets.MNIST(
+                        root="dec/data",
+                        train=True,
+                        download=True,
+                        transform=ToTensor()
+                    ),
+                    "test": datasets.MNIST(
+                        root="dec/data",
+                        train=False,
+                        download=True,
+                        transform=ToTensor()
+                    ),
+                    "n_clusters": 10
+                },
+                {
+                    "name": "STL10",
+                    "train": datasets.STL10(
+                        root="dec/data",
+                        split="train",
+                        download=True,
+                        transform=Compose([Resize(28), ToTensor()])
+                    ),
+                    "test": datasets.STL10(
+                        root="dec/data",
+                        split="test",
+                        download=True,
+                        transform=Compose([Resize(28), ToTensor()])
+                    ),
+                    "n_clusters": 10
+                },
+                {
+                    "name": "REUTERS",
+                    "train": lambda: TensorDataset(
+                        torch.tensor(load_reuters("train", return_X_y=True)[0], dtype=torch.float32),
+                        torch.tensor(load_reuters("train", return_X_y=True)[1], dtype=torch.long)
+                    ),
+                    "test": lambda: TensorDataset(
+                        torch.tensor(load_reuters("test", return_X_y=True)[0], dtype=torch.float32),
+                        torch.tensor(load_reuters("test", return_X_y=True)[1], dtype=torch.long)
+                    ),
+                    "n_clusters": 4,
+                },
+            ]
+            for dataset_config in dataset_configs:
+                backprop = True
+                for hyperparameter in range(1, 11):
+                    acc = run_pipeline(dataset_config, hyperparameter, backprop)
+                    save_accuracy(backprop, dataset_config['name'], hyperparameter, acc)
+
+                    
+            return
+    else:
+        # Download training data from open datasets.
+        training_data = datasets.MNIST(
+            root="dec/data",
+            train=True,
+            download=True,
+            transform=ToTensor(),
+        )
+
+        # Download test data from open datasets.
+        test_data = datasets.MNIST(
+            root="dec/data",
+            train=False,
+            download=True,
+            transform=ToTensor(),
+        )
+
+        # Create data loaders
+        train_dataloader = DataLoader(training_data, batch_size=config['batch_size'], shuffle=True)
+        train_dataloader_noshuffle = DataLoader(training_data, batch_size=config['batch_size'], shuffle=False)
+        test_dataloader = DataLoader(test_data, batch_size=config['batch_size'])
+
+        # device = torch.accelerator.current_accelerator().type if torch.accelerator.is_available() else "cpu"
+        print(f"Using {device} device")
+
+        # Create model
+        model = StackedAutoEncoder().to(device)
+        loss_fn = nn.MSELoss()
+        optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
+
+        # Train model - create a latent space via encoder
+        print("=== Phase 1: Training Autoencoder ===")
+        train_autoencoder(train_dataloader, model, loss_fn, optimizer, epochs=config["epochs"])
+
+        # Create intial k-means centroids in latent space
+        print("\n=== Phase 2: K-Means Clustering in Latent Space ===")
+        z_train, labels_train = get_latent_vectors(train_dataloader_noshuffle, model)
+        z_test,  labels_test  = get_latent_vectors(test_dataloader,  model)
+        print(f"Latent vectors shape: {z_train.shape}")  # should be (60000, latent_dim)
+        cluster_assignments_train, kmeans = run_kmeans(z_train, n_clusters=config["n_clusters"])
+        cluster_assignments_test = kmeans.predict(z_test)
+
+        print("\n=== Phase 2b: Initial Accuracy")
+        acc_train, label_mapping = hungarian_accuracy(labels_train, cluster_assignments_train)
+        acc_test, _ = hungarian_accuracy(labels_test, cluster_assignments_test)
+        print(f"Train clustering accuracy: {acc_train*100:.1f}%")
+        print(f"Test clustering accuracy: {acc_test*100:.1f}%")
+        print(f"Cluster → Digit mapping: {label_mapping}")
+
+        print("\n=== Phase 3: Cluster refinement ===")
+        model.init_centroids(kmeans.cluster_centers_)
+        optimizer_dec = torch.optim.SGD(
+            model.parameters(),  # encoder + centroids, decoder gets frozen naturally
+            lr=config["lr"]
+        )
+        train_dec(train_dataloader_noshuffle, model, optimizer_dec, epochs=config["refine_epochs"], run="epoch") # run = epoch / tol
+
+        print("\n=== Final Evaluation ===")
+        model.eval()
+        all_q, all_labels = [], []
+        with torch.no_grad():
+            for X, y in test_dataloader:
+                z = model.encode(X.to(device))
+                q = model.soft_assign(z)
+                all_q.append(q.cpu())
+                all_labels.append(y)
+
+        all_q = torch.cat(all_q)
+        all_labels = torch.cat(all_labels).numpy()
+        final_assignments = all_q.argmax(dim=1).numpy()
+
+        test_acc, label_mapping = hungarian_accuracy(all_labels, final_assignments)
+        print(f"Test clustering accuracy: {test_acc*100:.1f}%")
+        print(f"Cluster -> Digit mapping: {label_mapping}")
+
+if __name__ == "__main__":
+    main()
