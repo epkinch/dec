@@ -380,7 +380,7 @@ def main():
                 # },
             ]
             for dataset_config in dataset_configs:
-                backprop = False
+                backprop = True
                 for hyperparameter in range(1, 11):
                     acc = run_pipeline(dataset_config, hyperparameter, backprop)
                     save_accuracy(backprop, dataset_config['name'], hyperparameter, acc)
