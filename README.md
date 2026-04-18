@@ -1,6 +1,6 @@
 # Deep Embedded Clustering
 
-This package implements the algorithm described in paper "Unsupervised Deep Embedding for Clustering Analysis". It depends on {}.
+This package implements the algorithm described in paper "Unsupervised Deep Embedding for Clustering Analysis".
 
 This implementation is intended for reproducing the results in the paper using PyTorch.
 
@@ -10,7 +10,7 @@ To compare the hyperparamater vs accuracy of our DEC model and KMeans, Spectral 
 
 To get the hyperparameter vs accuracy datapoints for MNIST and Spectral Clustering, run replication.py. All accuracies are saved in the same csv.
 
-To graph your results, run graphy.py. You should get a figure 
+To graph your results, run graphy.py. You should get a figure similar to figure 2 of the original paper.
 
 ### Docker
 
