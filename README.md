@@ -10,10 +10,8 @@ To compare the hyperparamater vs accuracy of our DEC model and KMeans, Spectral 
 
 To get the hyperparameter vs accuracy datapoints for MNIST and Spectral Clustering, run replication.py. All accuracies are saved in the same csv.
 
+To graph your results, run graph.py. You should get a figure similar to figure 2 of the original paper.
+
 To get the epochs graph just run the DEC2.py in a compiler such as spyder6 or Visual studios. The graph would be saved in a file in the desktop. 
-
-To graph your results, run graphy.py. You should get a figure similar to figure 2 of the original paper.
-
-### Docker
 
 
